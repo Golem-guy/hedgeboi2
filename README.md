@@ -1,9 +1,9 @@
 # NSE Options Vault
 
 Polls NSE's live option chain for NIFTY, BANKNIFTY, and NIFTYNXT50 on a
-schedule, computes implied volatility and a full set of Greeks from a
-**synchronized** spot + option quote snapshot, and commits the results to
-this repo as dated files under `vault/`.
+schedule, records a **synchronized** spot + option quote snapshot, computes a
+full set of Greeks from NSE's own published implied volatility, and commits the
+results to this repo as dated files under `vault/`.
 
 ## Why this exists (short version)
 
@@ -13,32 +13,37 @@ compared against a spot price effectively as of close. Computing IV/Greeks
 off that mismatched pair produces numbers that look precise but are
 disconnected from the real market at any single moment.
 
-This bot instead pulls spot and the full option chain in one call, prefers
-the live bid/ask midpoint over last-traded-price when solving for IV, and
-timestamps every row with its own fetch clock — not the nominal schedule
-time.
+This bot instead pulls spot and the full option chain in one call (so quote and
+underlying are from the same instant), uses NSE's own published IV to compute
+Greeks, and timestamps every row with its own fetch clock — not the nominal
+schedule time. Live bid/ask is captured too, and the bid/ask midpoint is used
+as a below-intrinsic-value guardrail against stale/bad quotes (see the data
+dictionary).
 
 ## Folder structure
 
 ```
 vault/
 ├── raw/
-│   ├── NIFTY/JSON-18-08-2026.json.gz
-│   ├── BANKNIFTY/JSON-18-08-2026.json.gz
-│   └── NIFTYNXT50/JSON-18-08-2026.json.gz
+│   ├── NIFTY/JSON-2026-08-18.json.gz
+│   ├── BANKNIFTY/JSON-2026-08-18.json.gz
+│   └── NIFTYNXT50/JSON-2026-08-18.json.gz
 └── tables/
-    └── MAIN-18-08-2026.csv
+    ├── NIFTY/MAIN-2026-08-18.csv
+    ├── BANKNIFTY/MAIN-2026-08-18.csv
+    └── NIFTYNXT50/MAIN-2026-08-18.csv
 ```
 
-- **`vault/raw/<SYMBOL>/JSON-DD-MM-YYYY.json.gz`** — one growing, gzipped
+- **`vault/raw/<SYMBOL>/JSON-YYYY-MM-DD.json.gz`** — one growing, gzipped
   file per symbol per day. Each fetch cycle appends one more entry (a list
   element) containing that cycle's *untouched* NSE responses (option
-  chain, futures, index/VIX snapshot) plus a per-source `fetch_status`.
-  This is the future-proofing layer: any field you didn't think to parse
-  into the table today is still recoverable from here later.
-- **`vault/tables/MAIN-DD-MM-YYYY.csv`** — one growing file per day, **all
-  three symbols combined**, one row per strike × expiry × option type ×
-  fetch cycle.
+  chain bootstrap, option-chain-v3, index/VIX snapshot) plus a per-source
+  `fetch_status`. This is the future-proofing layer: any field you didn't
+  think to parse into the table today is still recoverable from here later.
+- **`vault/tables/<SYMBOL>/MAIN-YYYY-MM-DD.csv`** — one growing file per
+  symbol per day (mirroring the `raw/` layout), one row per strike × expiry
+  × option type × fetch cycle. Each symbol gets its **own** file; tables are
+  not merged across symbols.
 
 Filenames are zero-padded (`18-08-2026`, not `18-8-2026`) for clean
 lexicographic sorting.
@@ -85,17 +90,24 @@ returns unusable data, so it doesn't need separate handling.
 
 ## Before you trust this unattended
 
-- **The futures endpoint (`quote-derivative`) and the index-snapshot
-  endpoint (`allIndices`) are less battle-tested than the option-chain
-  endpoint.** Their exact JSON key names could differ slightly from what's
-  coded in `nse_fetch.py` — I wrote the parsing based on documented/
-  typical NSE response shapes but couldn't execute a live call against
-  nseindia.com to verify field-for-field (network-restricted environment).
-  Run a manual `workflow_dispatch` cycle, then check whether `futures_price`,
-  `lot_size`, `india_vix`, and `underlying_day_*` columns actually populated
-  in the MAIN csv — if they're all null, open the raw JSON archive for that
-  symbol and diff the actual response shape against `parse_futures` /
+- **Data-source history:** the old `option-chain-indices` endpoint is
+  effectively retired (returns `{}`), and the `quote-derivative` endpoint
+  is confirmed dead (genuine 404 on every URL shape tried). Futures prices
+  now come from the futures legs inside the option-chain response itself
+  (`parse_futures_from_entries`), and lot size has **no** live source at
+  all — `LOT_SIZE_FALLBACK` in `nse_fetch.py` is the only source. Run a
+  manual `workflow_dispatch` cycle, then check whether `futures_price`,
+  `india_vix`, and `underlying_day_*` columns actually populated in the
+  MAIN csv — if they're all null, open the raw JSON archive for that symbol
+  and diff the actual response shape against `parse_futures_from_entries` /
   `parse_index_snapshot` in `nse_fetch.py`.
+- **Dividend yield** is sourced from the index's own NSE-published yield
+  (`allIndices` `dy` field), **not** from a futures-basis calculation. An
+  earlier design derived `q` from the futures basis (`b = ln(F/S)/T`), but
+  that blows up for near-expiry contracts (a tiny `T` annualizes normal
+  basis noise into absurd rates — a 4-day NIFTY strike once showed a 20%+
+  cost-of-carry and −14% yield). `futures_price` and `implied_cost_of_carry`
+  are still recorded as diagnostic columns, but no longer drive `q`.
 - **Lot sizes** (`nse_fetch.LOT_SIZE_FALLBACK`) are current as of the
   January 2026 NSE revision (NIFTY 65, BANKNIFTY 30, NIFTYNXT50 25) — these
   get revised periodically by NSE circular, so re-check and update this
@@ -120,26 +132,25 @@ returns unusable data, so it doesn't need separate handling.
 | `underlying_value` | Spot, from the **same** response as the option quote (this is what makes it synchronized) |
 | `bid_price` / `bid_qty`, `ask_price` / `ask_qty` | Live quote, top of book |
 | `ltp` | Last traded price — can be stale on illiquid strikes, kept for reference/fallback only |
-| `mid_price` | (bid+ask)/2 — **preferred over LTP** for the IV solve |
+| `mid_price` | (bid+ask)/2 — used as the below-intrinsic-value guardrail (see `price_source_for_iv`) |
 | `open_interest` / `change_in_oi` | Standard OI fields |
 | `total_traded_volume` | Volume for the day so far |
 | `pchange_vs_prev_close` | % change vs previous close, as published directly by NSE |
-| `nse_iv` | NSE's own published IV for this strike — compare against `computed_iv` as a sanity check |
-| `futures_price` | Same symbol/expiry futures price, used to derive cost-of-carry (see below) |
+| `nse_iv` | NSE's own published IV for this strike — the **only** IV column, and what the Greeks are computed from (arrives as a percentage, e.g. `8.8`) |
+| `futures_price` | Same symbol/expiry futures price — diagnostic only (no longer drives cost-of-carry; see below) |
 | `india_vix` | Repeated on every row for easy filtering, though it's really one value per fetch cycle, not per strike |
 | `lot_size` | Contract multiplier — from the live futures response if parseable, else the static fallback table |
 | `underlying_day_open/high/low/prev_close` | Underlying index's own day OHLC (also repeated per fetch cycle) |
 
-### How IV / Greeks were computed
+### How Greeks were computed
 | Column | Meaning |
 |---|---|
-| `price_source_for_iv` | `mid_price`, `ltp`, or `none` — which price was actually used to solve for IV |
-| `implied_cost_of_carry` | `b = ln(F/S)/T`, derived from the futures price — this is what actually drives the dividend-yield estimate, not a guess |
-| `dividend_yield_used` | `q = risk_free_rate − b` — fed into the Black-Scholes formulas |
-| `dividend_yield_source` | `futures_implied` (trust this) or `static_fallback` (futures unavailable this cycle — lower confidence) |
-| `risk_free_rate_used` | Static assumption (see `run_fetch.py`); only affects discounting once cost-of-carry is futures-implied, so its impact on Delta/IV is small |
-| `computed_iv` | Our own solved IV, from `price_source_for_iv` |
-| `data_quality_flag` | `ok`, `wide_quote_low_liquidity` (usable price but a wide bid-ask spread — treat with more caution), or `no_price_available` (guardrail tripped: no usable price, or price below intrinsic value — a sign of a stale/bad quote; IV/Greeks left null rather than force-fit) |
+| `price_source_for_iv` | `mid_price`, `ltp`, or `none` — which price the below-intrinsic-value guardrail was checked against (Greeks themselves use `nse_iv`, not a solved IV) |
+| `implied_cost_of_carry` | `b = ln(F/S)/T`, derived from the futures price — diagnostic only; **not** used to derive the dividend yield anymore |
+| `dividend_yield_used` | `q` fed into the Black-Scholes formulas — the index's own NSE-published dividend yield (as a decimal) |
+| `dividend_yield_source` | `index_dividend_yield` (from `allIndices`' `dy` field — trust this) or `static_fallback` (index yield unavailable this cycle — lower confidence, defaults to 0) |
+| `risk_free_rate_used` | Static assumption (see `run_fetch.py`); only affects discounting, so its impact on Delta is small |
+| `data_quality_flag` | `ok`, `wide_quote_low_liquidity` (usable price but a wide bid-ask spread — treat with more caution), `no_price_available` (guardrail tripped: no usable price, or price below intrinsic value — a sign of a stale/bad quote; Greeks left null rather than force-fit), or `no_nse_iv` (NSE published no usable IV for this strike, so Greeks are left null) |
 
 ### Greeks (all Black-Scholes-Merton, using `dividend_yield_used` above)
 | Column | Order | Meaning |
